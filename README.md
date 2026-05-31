@@ -1,10 +1,10 @@
 # Практическое занятие 15
 ## Шишков А.Д. ЭФМО-02-25
 ## Тема
-Развертывание сервиса `tasks` на Linux VPS через `systemd`
+Деплой приложения на VPS. Настройка systemd
 
 ## Цель
-Освоить развертывание Go-сервиса на удаленном Linux-сервере, научиться запускать приложение как системную службу через `systemd`, выносить конфигурацию в отдельный `env`-файл, выполнять проверку работоспособности через `/health`, а также выполнять базовые операции сопровождения: запуск, автозапуск, просмотр логов, обновление и откат.
+Освоить публикацию backend-приложения на удалённом Linux-сервере, научиться подключаться к VPS по SSH, размещать исполняемый файл приложения, настраивать переменные окружения, создавать unit-файл systemd, управлять сервисом через systemctl, анализировать логи через journalctl и выполнять базовую процедуру обновления версии приложения.
 
 ---
 
@@ -30,9 +30,8 @@ sudo apt update
 sudo apt upgrade -y
 ```
 
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 1 - SSH-подключение к VPS]
-```
+<img width="891" height="530" alt="image" src="https://github.com/user-attachments/assets/1de0d4a1-2cca-4882-80bb-92b97d3d24c3" /> 
+
 
 Далее создается отдельный системный пользователь для запуска сервиса:
 
@@ -159,9 +158,8 @@ sudo systemctl enable tasks
 sudo systemctl status tasks
 ```
 
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 2 - Статус службы tasks]
-```
+<img width="2152" height="462" alt="image" src="https://github.com/user-attachments/assets/781c2ecc-d31a-4e72-87ea-f423676065f0" /> 
+
 
 Проверка автозапуска:
 
@@ -175,9 +173,8 @@ sudo systemctl is-enabled tasks
 enabled
 ```
 
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 3 - Автозапуск службы]
-```
+<img width="552" height="51" alt="image" src="https://github.com/user-attachments/assets/f3e67970-2738-486f-b3c0-9221611528b4" /> 
+
 
 ---
 
@@ -195,9 +192,8 @@ sudo journalctl -u tasks --no-pager -n 50
 sudo journalctl -u tasks -f
 ```
 
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 4 - Логи службы через journalctl]
-```
+<img width="2177" height="293" alt="image" src="https://github.com/user-attachments/assets/a883e062-0a8a-4aa9-9a66-66ecc6f08b4e" /> 
+
 
 ---
 
@@ -218,9 +214,8 @@ Content-Type: application/json
 {"instance":"tasks-default","service":"tasks","status":"ok"}
 ```
 
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 5 - Проверка /health]
-```
+<img width="623" height="191" alt="image" src="https://github.com/user-attachments/assets/9e67e85a-1757-4a94-9192-084d9e5d4c4c" /> 
+
 
 ---
 
@@ -246,9 +241,8 @@ sudo systemctl restart tasks
 sudo systemctl status tasks
 ```
 
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 6 - Обновление службы]
-```
+<img width="2141" height="644" alt="image" src="https://github.com/user-attachments/assets/96986f66-301f-492d-b62b-97729fdd0c88" /> 
+
 
 ---
 
@@ -264,9 +258,7 @@ sudo systemctl restart tasks
 sudo systemctl status tasks
 ```
 
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 7 - Откат службы]
-```
+<img width="1805" height="392" alt="image" src="https://github.com/user-attachments/assets/94e9a213-cf74-4c3c-937f-1aaecd35c979" />
 
 ---
 ## Выводы
