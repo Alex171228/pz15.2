@@ -1,429 +1,278 @@
-# Практическое занятие 14
+# Практическое занятие 15
 ## Шишков А.Д. ЭФМО-02-25
 ## Тема
-Реализация очереди задач. Модель producer-consumer, повторные попытки обработки, DLQ и идемпотентность
+Развертывание сервиса `tasks` на Linux VPS через `systemd`
 
 ## Цель
-Освоить построение очереди задач по модели producer-consumer с использованием RabbitMQ, научиться организовывать повторные попытки обработки, настраивать очередь проблемных сообщений DLQ, а также реализовывать базовую идемпотентность обработчика для защиты от повторной обработки одного и того же сообщения.
+Освоить развертывание Go-сервиса на удаленном Linux-сервере, научиться запускать приложение как системную службу через `systemd`, выносить конфигурацию в отдельный `env`-файл, выполнять проверку работоспособности через `/health`, а также выполнять базовые операции сопровождения: запуск, автозапуск, просмотр логов, обновление и откат.
 
 ---
 
-## Краткое описание реализованного решения
+## Краткое описание выполненной работы
 
-В существующий проект добавлена очередь задач `task_jobs`. Сервис `tasks` принимает HTTP-запрос на постановку задачи в очередь и публикует сообщение в RabbitMQ. Отдельный сервис `worker` получает сообщение, проверяет его по `message_id`, имитирует обработку и затем:
+В рамках задания сервис `tasks` был собран в виде Linux-бинарника и развернут на VPS. Для запуска использовалась модель `binary + systemd`, без Docker. На сервере был создан отдельный системный пользователь `tasksuser`, подготовлены каталоги для бинарника и конфигурации, создан файл окружения `tasks.env`, а также unit-файл `tasks.service`.
 
-- подтверждает сообщение через `Ack(false)`, если обработка успешна;
-- повторно публикует сообщение в основную очередь, если произошла ошибка и лимит попыток еще не исчерпан;
-- публикует сообщение в очередь проблемных сообщений `task_jobs_dlq`, если число попыток превышено.
+После настройки служба была зарегистрирована в `systemd`, запущена и добавлена в автозапуск. Работоспособность проверена через:
 
-Для учебной демонстрации используется простое правило:
-
-- если `task_id == "t_fail"`, обработка всегда завершается ошибкой;
-- для остальных значений `task_id` обработка считается успешной.
-
-Идемпотентность реализована на учебном уровне: `worker` хранит уже обработанные `message_id` в памяти и не выполняет одну и ту же задачу повторно.
+- `systemctl status`
+- `journalctl`
+- `curl http://127.0.0.1:8082/health`
 
 ---
 
-## Используемые компоненты
+## Подготовка сервера
 
-- `services/tasks` - HTTP-сервис, публикующий job в очередь;
-- `services/worker` - отдельный consumer, обрабатывающий задачи из очереди;
-- `services/auth` - сервис авторизации для доступа к `tasks`;
-- `RabbitMQ` - брокер сообщений;
-- `PostgreSQL` - хранилище задач;
-- `Redis` - кэш в сервисе `tasks`.
-
----
-
-## Запуск RabbitMQ
-
-Для работы используется Docker-контейнер с management-интерфейсом.
-
-```yaml
-version: "3.9"
-
-services:
-  rabbitmq:
-    image: rabbitmq:3-management
-    container_name: pz14-rabbitmq
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
-```
-
-Запуск:
+Сначала выполняется подключение к VPS по `SSH` и обновление пакетов:
 
 ```bash
-cd deploy/rabbit
-docker compose up -d
-docker compose ps
+ssh root@178.20.209.97
+sudo apt update
+sudo apt upgrade -y
 ```
-
-После запуска доступны:
-
-- AMQP-порт `5672` для приложений;
-- RabbitMQ Management UI: [http://localhost:15672](http://localhost:15672);
-- логин и пароль: `guest / guest`.
 
 ```text
-[МЕСТО ДЛЯ СКРИНШОТА 1 - RabbitMQ запущен]
+[МЕСТО ДЛЯ СКРИНШОТА 1 - SSH-подключение к VPS]
 ```
 
----
-
-## Формат сообщения
-
-Сообщение задачи публикуется в формате JSON и содержит обязательные поля:
-
-```json
-{
-  "job": "process_task",
-  "task_id": "t_001",
-  "attempt": 1,
-  "message_id": "uuid-here"
-}
-```
-
-Структура сообщения:
-
-```go
-type TaskJob struct {
-    Job       string `json:"job"`
-    TaskID    string `json:"task_id"`
-    Attempt   int    `json:"attempt"`
-    MessageID string `json:"message_id"`
-}
-```
-
-Описание полей:
-
-- `job` - тип выполняемой задачи;
-- `task_id` - идентификатор бизнес-объекта;
-- `attempt` - номер текущей попытки обработки;
-- `message_id` - уникальный идентификатор сообщения.
-
----
-
-## Очереди `task_jobs` и `task_jobs_dlq`
-
-В проекте используются две очереди:
-
-- основная очередь задач `task_jobs`;
-- очередь проблемных сообщений `task_jobs_dlq`.
-
-Очереди объявляются как `durable` и используются сервисами `tasks` и `worker`.
-
-Параметры очередей:
-
-- `durable = true`
-- `autoDelete = false`
-- `exclusive = false`
-
-Это означает:
-
-- очереди сохраняются после перезапуска RabbitMQ;
-- очереди не удаляются автоматически;
-- очереди не привязаны к одному клиентскому соединению.
-
----
-
-## Producer: постановка задачи в очередь
-
-В сервисе `tasks` реализован endpoint:
-
-```text
-POST /v1/jobs/process-task
-```
-
-Тело запроса:
-
-```json
-{
-  "task_id": "t_001"
-}
-```
-
-После получения запроса сервис:
-
-- проверяет входные данные;
-- формирует сообщение `TaskJob`;
-- назначает `attempt = 1`;
-- генерирует `message_id`;
-- публикует сообщение в `task_jobs`;
-- возвращает клиенту подтверждение.
-
-Пример ответа:
-
-```json
-{
-  "status": "accepted",
-  "task_id": "t_001",
-  "message_id": "uuid-here",
-  "attempt": 1
-}
-```
-
----
-
-## Consumer: обработка задач в сервисе `worker`
-
-Для обработки сообщений реализован отдельный сервис `worker`.
-
-Основные характеристики consumer:
-
-- подключается к RabbitMQ;
-- читает сообщения из `task_jobs`;
-- проверяет `message_id`;
-- имитирует обработку;
-- при ошибке делает повторную попытку;
-- после превышения лимита переводит сообщение в `task_jobs_dlq`.
-
----
-
-## Повторные попытки обработки
-
-В проекте реализована простая стратегия retry.
-
-Если обработка завершилась ошибкой:
-
-- `worker` увеличивает `attempt`;
-- если лимит попыток не превышен, публикует сообщение заново в `task_jobs`;
-- если лимит превышен, публикует сообщение в `task_jobs_dlq`;
-- исходное сообщение подтверждает через `Ack(false)`.
-
-По умолчанию используется:
-
-```text
-MAX_ATTEMPTS=3
-```
-
-Это означает:
-
-- первая попытка;
-- вторая попытка после ошибки;
-- третья попытка после повторной ошибки;
-- после следующей ошибки сообщение переводится в DLQ.
-
----
-
-## Идемпотентная проверка по `message_id`
-
-Перед выполнением обработки `worker` проверяет, не было ли сообщение уже обработано ранее.
-
-Для учебной версии используется хранение обработанных `message_id` в памяти.
-
-Если сообщение с тем же `message_id` приходит повторно:
-
-- обработчик не выполняет задачу повторно;
-- сообщение сразу подтверждается через `Ack(false)`.
-
----
-
-## Переменные окружения
-
-### Для сервиса `tasks`
-
-- `TASKS_PORT` - порт сервиса, по умолчанию `8082`
-- `DATABASE_URL` - строка подключения к PostgreSQL
-- `AUTH_MODE` - режим авторизации: `http` или `grpc`
-- `AUTH_BASE_URL` - адрес HTTP auth-сервиса
-- `AUTH_GRPC_ADDR` - адрес gRPC auth-сервиса
-- `REDIS_ADDR` - адрес Redis
-- `RABBIT_URL` - адрес RabbitMQ, по умолчанию `amqp://guest:guest@localhost:5672/`
-- `EVENT_QUEUE_NAME` - очередь событий, по умолчанию `task_events`
-- `JOB_QUEUE_NAME` - имя основной очереди, по умолчанию `task_jobs`
-- `JOB_DLQ_NAME` - имя DLQ, по умолчанию `task_jobs_dlq`
-
-### Для сервиса `worker`
-
-- `RABBIT_URL` - адрес RabbitMQ, по умолчанию `amqp://guest:guest@localhost:5672/`
-- `JOB_QUEUE_NAME` - имя основной очереди, по умолчанию `task_jobs`
-- `JOB_DLQ_NAME` - имя DLQ, по умолчанию `task_jobs_dlq`
-- `WORKER_PREFETCH` - значение `prefetch`, по умолчанию `1`
-- `MAX_ATTEMPTS` - максимальное число попыток, по умолчанию `3`
-
----
-
-## Демонстрация работы
-
-### Подготовка зависимостей
-
-Перед запуском сервисов должны быть доступны:
-
-- PostgreSQL на `5432`;
-- Redis на `6379`;
-- RabbitMQ на `5672` и `15672`.
-
-### Запуск auth-сервиса
+Далее создается отдельный системный пользователь для запуска сервиса:
 
 ```bash
-go run ./services/auth/cmd/auth
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin tasksuser
 ```
 
-### Запуск worker
+После этого создаются рабочие каталоги:
 
-```powershell
-$env:RABBIT_URL="amqp://guest:guest@localhost:5672/"
-$env:JOB_QUEUE_NAME="task_jobs"
-$env:JOB_DLQ_NAME="task_jobs_dlq"
-$env:WORKER_PREFETCH="1"
-$env:MAX_ATTEMPTS="3"
-go run ./services/worker/cmd/worker
+```bash
+sudo mkdir -p /opt/tasks
+sudo mkdir -p /etc/tasks
 ```
 
-### Запуск tasks
+---
 
-```powershell
-$env:RABBIT_URL="amqp://guest:guest@localhost:5672/"
-$env:JOB_QUEUE_NAME="task_jobs"
-$env:JOB_DLQ_NAME="task_jobs_dlq"
-$env:REDIS_ADDR="127.0.0.1:6379"
-go run ./services/tasks/cmd/tasks
+## Сборка Linux-бинарника
+
+На локальной машине сервис `tasks` собирается в Linux-бинарник:
+
+```bash
+mkdir -p bin
+GOOS=linux GOARCH=amd64 go build -o bin/tasks ./services/tasks/cmd/tasks
 ```
 
-### Получение токена
+После сборки получается исполняемый файл `tasks`, предназначенный для запуска на Linux VPS.
 
-Параметры запроса:
+---
 
-- метод: `POST`
-- URL: `http://localhost:8081/v1/auth/login`
-- заголовок: `Content-Type: application/json`
-- тело:
+## Копирование бинарника на сервер
 
-```json
-{
-  "username": "student",
-  "password": "student"
-}
+Собранный бинарник копируется на VPS:
+
+```bash
+scp bin/tasks root@178.20.209.97:/root/tasks
 ```
 
-Ожидаемый ответ:
+Затем на сервере файл переносится в рабочую директорию сервиса и получает нужные права:
 
-```json
-{
-  "access_token": "demo-token",
-  "token_type": "Bearer"
-}
+```bash
+sudo mv /root/tasks /opt/tasks/tasks
+sudo chown tasksuser:tasksuser /opt/tasks/tasks
+sudo chmod 755 /opt/tasks/tasks
+```
+
+---
+
+## Конфигурационный файл
+
+Файл окружения создается по пути:
+
+```bash
+sudo nano /etc/tasks/tasks.env
+```
+
+Содержимое файла:
+
+```env
+TASKS_PORT=8082
+DATABASE_URL=postgres://tasks:tasks@127.0.0.1:5432/tasks?sslmode=disable
+AUTH_MODE=http
+AUTH_BASE_URL=http://127.0.0.1:8081
+REDIS_ADDR=127.0.0.1:6379
+RABBIT_URL=amqp://guest:guest@127.0.0.1:5672/
+JOB_QUEUE_NAME=task_jobs
+JOB_DLQ_NAME=task_jobs_dlq
+EVENT_QUEUE_NAME=task_events
+```
+
+После создания конфигурационного файла задаются права доступа:
+
+```bash
+sudo chown root:root /etc/tasks/tasks.env
+sudo chmod 600 /etc/tasks/tasks.env
+```
+
+---
+
+## Unit-файл systemd
+
+Для запуска приложения как системной службы создается unit-файл:
+
+```bash
+sudo nano /etc/systemd/system/tasks.service
+```
+
+Содержимое unit-файла:
+
+```ini
+[Unit]
+Description=Tasks Service
+After=network.target
+
+[Service]
+Type=simple
+User=tasksuser
+WorkingDirectory=/opt/tasks
+EnvironmentFile=/etc/tasks/tasks.env
+ExecStart=/opt/tasks/tasks
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## Запуск службы
+
+После создания unit-файла выполняется перечитывание конфигурации `systemd`, запуск службы и включение автозапуска:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start tasks
+sudo systemctl enable tasks
+```
+
+Проверка статуса службы:
+
+```bash
+sudo systemctl status tasks
 ```
 
 ```text
-[МЕСТО ДЛЯ СКРИНШОТА 2 - Получение токена]
+[МЕСТО ДЛЯ СКРИНШОТА 2 - Статус службы tasks]
 ```
 
-### Успешная обработка job
+Проверка автозапуска:
 
-Команда:
-
-```powershell
-curl -i -X POST http://localhost:8082/v1/jobs/process-task `
-  -H "Content-Type: application/json" `
-  -H "Authorization: Bearer demo-token" `
-  -d "{\"task_id\":\"t_001\"}"
+```bash
+sudo systemctl is-enabled tasks
 ```
 
 Ожидаемый результат:
 
-- сервис `tasks` возвращает `202 Accepted`;
-- сообщение публикуется в `task_jobs`;
-- `worker` получает job;
-- обработка завершается успешно;
-- сообщение подтверждается через `Ack(false)`.
-
-Пример ответа:
-
-```json
-{
-  "status": "accepted",
-  "task_id": "t_001",
-  "message_id": "uuid-here",
-  "attempt": 1
-}
+```text
+enabled
 ```
 
 ```text
-[МЕСТО ДЛЯ СКРИНШОТА 3 - Успешная постановка job]
-```
-
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 4 - Успешная обработка в worker]
-```
-
-### Обработка с ошибкой, retries и DLQ
-
-Команда:
-
-```powershell
-curl -i -X POST http://localhost:8082/v1/jobs/process-task `
-  -H "Content-Type: application/json" `
-  -H "Authorization: Bearer demo-token" `
-  -d "{\"task_id\":\"t_fail\"}"
-```
-
-Ожидаемое поведение:
-
-- первая попытка завершается ошибкой;
-- `worker` публикует сообщение повторно с увеличенным `attempt`;
-- вторая попытка завершается ошибкой;
-- третья попытка завершается ошибкой;
-- после превышения лимита сообщение публикуется в `task_jobs_dlq`.
-
-В логах `worker` должны быть видны строки:
-
-```text
-task job received
-task job failed
-job scheduled for retry
-job published to dlq
-```
-
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 5 - Retry в worker]
-```
-
-### Проверка через RabbitMQ Management UI
-
-Открыть [http://localhost:15672](http://localhost:15672), войти под `guest / guest`, затем перейти в раздел `Queues and Streams`.
-
-На странице должно быть видно:
-
-- очередь `task_jobs`;
-- очередь `task_jobs_dlq`;
-- наличие consumer у основной очереди;
-- попадание сообщения в DLQ после неудачной обработки.
-
-```text
-[МЕСТО ДЛЯ СКРИНШОТА 6 - Сообщение в DLQ]
+[МЕСТО ДЛЯ СКРИНШОТА 3 - Автозапуск службы]
 ```
 
 ---
 
-## Проверка соответствия заданию
+## Просмотр логов
 
-В рамках практической работы требовалось:
+Для просмотра последних записей журнала используется команда:
 
-- поднять RabbitMQ;
-- создать основную очередь задач и DLQ;
-- реализовать endpoint для постановки `job` в очередь;
-- реализовать `worker` по модели producer-consumer;
-- добавить поле `attempt`;
-- реализовать ограничение числа попыток;
-- реализовать перевод сообщения в DLQ при превышении лимита попыток;
-- реализовать идемпотентную проверку по `message_id`;
-- показать успешную обработку и обработку с ошибкой.
+```bash
+sudo journalctl -u tasks --no-pager -n 50
+```
 
-Все перечисленные требования в проекте выполнены.
+Для просмотра логов в реальном времени:
+
+```bash
+sudo journalctl -u tasks -f
+```
+
+```text
+[МЕСТО ДЛЯ СКРИНШОТА 4 - Логи службы через journalctl]
+```
 
 ---
 
+## Проверка работоспособности
+
+После запуска службы выполняется проверка health endpoint на самом сервере:
+
+```bash
+curl -i http://127.0.0.1:8082/health
+```
+
+Ожидаемый ответ:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"instance":"tasks-default","service":"tasks","status":"ok"}
+```
+
+```text
+[МЕСТО ДЛЯ СКРИНШОТА 5 - Проверка /health]
+```
+
+---
+
+## Обновление приложения
+
+Обновление сервиса выполняется заменой бинарника и перезапуском службы.
+
+На локальной машине собирается новая версия:
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o bin/tasks ./services/tasks/cmd/tasks
+scp bin/tasks root@178.20.209.97:/root/tasks.new
+```
+
+На сервере:
+
+```bash
+sudo cp /opt/tasks/tasks /opt/tasks/tasks.bak
+sudo mv /root/tasks.new /opt/tasks/tasks
+sudo chown tasksuser:tasksuser /opt/tasks/tasks
+sudo chmod 755 /opt/tasks/tasks
+sudo systemctl restart tasks
+sudo systemctl status tasks
+```
+
+```text
+[МЕСТО ДЛЯ СКРИНШОТА 6 - Обновление службы]
+```
+
+---
+
+## Откат к предыдущей версии
+
+Если после обновления новая версия работает некорректно, можно вернуть предыдущий бинарник:
+
+```bash
+sudo mv /opt/tasks/tasks.bak /opt/tasks/tasks
+sudo chown tasksuser:tasksuser /opt/tasks/tasks
+sudo chmod 755 /opt/tasks/tasks
+sudo systemctl restart tasks
+sudo systemctl status tasks
+```
+
+```text
+[МЕСТО ДЛЯ СКРИНШОТА 7 - Откат службы]
+```
+
+---
 ## Выводы
 
-- В проект успешно добавлена очередь задач `task_jobs`.
-- Отдельный сервис `worker` обрабатывает задачи по модели producer-consumer.
-- Реализовано ограничение числа попыток обработки через поле `attempt`.
-- После превышения лимита сообщение переводится в очередь `task_jobs_dlq`.
-- Реализована учебная идемпотентность по `message_id`.
-- Показан полный сценарий прохождения сообщения: от HTTP-запроса до успешной обработки или отправки в DLQ.
+- Сервис `tasks` успешно развернут на Linux VPS в виде отдельного бинарника.
+- Для запуска использован `systemd`, что обеспечивает удобное управление службой и автозапуск.
+- Конфигурация вынесена в отдельный файл окружения, что упрощает сопровождение.
+- Работоспособность сервиса подтверждена через `systemctl`, `journalctl` и `/health`.
+- Подготовлены базовые процедуры обновления и отката, необходимые для эксплуатации приложения.
